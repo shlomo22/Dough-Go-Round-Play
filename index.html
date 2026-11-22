@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Dough-Go-Round</title>
+<style>
+  /* One full-window game canvas on the shop's cream counter; a single deliberate light look. */
+  :root {
+    --counter: #FBEFE4;
+    --cocoa: #4A2C22;
+    --cocoa-soft: #6B4A3C;
+    --strawberry: #C93A63;
+    --track: #EBD4C2;
+    --font: "Fredoka", system-ui, sans-serif;
+    color-scheme: light;
+  }
+  html, body { height: 100%; }
+  body {
+    background: var(--counter);
+    color: var(--cocoa);
+    font-family: var(--font);
+    overflow: hidden;
+    touch-action: none;
+  }
+  #canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+    outline: none;
+  }
+  #status {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+    background: var(--counter);
+    text-align: center;
+  }
+  #status[hidden], .meter[hidden] { display: none; }
+  #status h1 { margin: 0; font-size: 32px; font-weight: 700; }
+  #status p { margin: 0; font-size: 16px; color: var(--cocoa-soft); max-width: 32ch; }
+  .meter { width: min(260px, 70vw); height: 12px; border-radius: 6px; background: var(--track); overflow: hidden; }
+  .meter > div { height: 100%; width: 0; background: var(--strawberry); transition: width 0.2s; }
+  @media (prefers-reduced-motion: reduce) { .meter > div { transition: none; } }
+</style>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;700&display=swap">
+
+<canvas id="canvas" tabindex="0">The game needs a browser with WebGL 2.</canvas>
+<div id="status" role="status">
+  <h1>Dough-Go-Round</h1>
+  <div class="meter" aria-hidden="true"><div id="bar"></div></div>
+  <p id="note">Loading the shop (about 10 MB)</p>
+</div>
+
+<style>
+  /* The password screen of the locked public version, in the loading
+     screen's look. */
+  #lock {
+    position: fixed;
+    inset: 0;
+    z-index: 2;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    padding: 0 max(16px, env(safe-area-inset-left, 0px));
+    background: var(--counter);
+    text-align: center;
+  }
+  #lock[hidden] { display: none; }
+  #lock h1 { margin: 0; font-size: 32px; font-weight: 700; }
+  #lock p { margin: 0; font-size: 16px; color: var(--cocoa-soft); max-width: 32ch; }
+  #lock form { display: flex; flex-direction: column; gap: 12px; width: min(300px, 100%); }
+  #lock input[type=password] {
+    font: inherit; font-size: 18px; padding: 12px 14px;
+    border: 2px solid var(--track); border-radius: 14px; background: #fff; color: var(--cocoa);
+  }
+  #lock input[type=password]:focus { outline: none; border-color: var(--strawberry); }
+  #lock label { font-size: 15px; color: var(--cocoa-soft); display: flex; gap: 8px; align-items: center; justify-content: center; }
+  #lock button {
+    font: inherit; font-size: 18px; font-weight: 700; padding: 12px; border: 0; border-radius: 14px;
+    background: var(--strawberry); color: #fff; cursor: pointer;
+  }
+  #lock button:disabled { opacity: 0.6; cursor: default; }
+  #lock-error { color: var(--strawberry) !important; min-height: 1.3em; }
+</style>
+<div id="lock" hidden>
+  <h1>Dough-Go-Round</h1>
+  <p>This game is still being tested. Enter the password to play.</p>
+  <form id="lock-form" autocomplete="off">
+    <input id="lock-password" type="password" placeholder="Password" aria-label="Password" required>
+    <label><input id="lock-remember" type="checkbox" checked> Remember on this device</label>
+    <button id="lock-button" type="submit">Play</button>
+  </form>
+  <p id="lock-error" role="alert"></p>
+</div>
+<script>
+  // The game data (game.enc) is encrypted with a key made from the password
+  // (tools/encrypt_game.py). The password opens it here, in the browser; the
+  // page then starts the game with the opened data. "Remember" keeps the key
+  // (not the password) on this device, so the lock is skipped next time.
+  window.GAME_LOCKED = true;
+  (function () {
+    const ROUNDS = 600000;
+    const KEPT = 'dough-go-round-key';
+    const lock = document.getElementById('lock');
+    const status = document.getElementById('status');
+    const form = document.getElementById('lock-form');
+    const input = document.getElementById('lock-password');
+    const remember = document.getElementById('lock-remember');
+    const button = document.getElementById('lock-button');
+    const error = document.getElementById('lock-error');
+    const sealed = fetch('game.enc').then(function (r) {
+      if (!r.ok) throw new Error('the game data is missing');
+      return r.arrayBuffer();
+    });
+
+    function parts(buffer) {
+      const bytes = new Uint8Array(buffer);
+      return { salt: bytes.slice(4, 20), nonce: bytes.slice(20, 32), data: bytes.slice(32) };
+    }
+
+    async function keyFrom(password, salt) {
+      const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveKey']);
+      return crypto.subtle.deriveKey({ name: 'PBKDF2', salt: salt, iterations: ROUNDS, hash: 'SHA-256' },
+        base, { name: 'AES-GCM', length: 256 }, true, ['decrypt']);
+    }
+
+    async function open(key) {
+      const p = parts(await sealed);
+      return crypto.subtle.decrypt({ name: 'AES-GCM', iv: p.nonce }, key, p.data);
+    }
+
+    function start(data) {
+      window.unlockedPck = data;
+      lock.hidden = true;
+      status.hidden = false;
+      if (window.startGame) window.startGame();
+    }
+
+    async function keep(key) {
+      try {
+        const raw = new Uint8Array(await crypto.subtle.exportKey('raw', key));
+        localStorage.setItem(KEPT, btoa(String.fromCharCode.apply(null, raw)));
+      } catch (e) { /* not kept: asked again next time */ }
+    }
+
+    async function tryKept() {
+      let kept = null;
+      try { kept = localStorage.getItem(KEPT); } catch (e) {}
+      if (!kept) return false;
+      try {
+        const raw = Uint8Array.from(atob(kept), function (c) { return c.charCodeAt(0); });
+        const key = await crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['decrypt']);
+        start(await open(key));
+        return true;
+      } catch (e) {
+        try { localStorage.removeItem(KEPT); } catch (e2) {}
+        return false;
+      }
+    }
+
+    form.addEventListener('submit', async function (event) {
+      event.preventDefault();
+      button.disabled = true;
+      error.textContent = '';
+      button.textContent = 'Opening…';
+      try {
+        const p = parts(await sealed);
+        const key = await keyFrom(input.value, p.salt);
+        const data = await open(key);
+        if (remember.checked) await keep(key);
+        start(data);
+      } catch (e) {
+        error.textContent = e && e.name === 'OperationError' ? "That password isn't right." : 'The game could not open: ' + (e && e.message ? e.message : e);
+        button.disabled = false;
+        button.textContent = 'Play';
+        input.select();
+      }
+    });
+
+    status.hidden = true;
+    if (!window.crypto || !crypto.subtle) {
+      lock.hidden = false;
+      error.textContent = 'This browser cannot open the game. Try a current Chrome, Safari, Firefox or Edge.';
+      button.disabled = true;
+    } else {
+      tryKept().then(function (opened) {
+        if (!opened) { lock.hidden = false; input.focus(); }
+      });
+    }
+  })();
+</script>
+<script>
+  // The page host serves only some file types and limits file size, so the
+  // engine is stored gzipped as engine-gz.wasm and the game data as
+  // game-pck.wasm. Hand Godot the files it asks for under their real names.
+  (function () {
+    const realFetch = window.fetch.bind(window);
+    window.fetch = async function (input, init) {
+      const url = typeof input === 'string' ? input : input.url;
+      if (/index\.wasm(\?|$)/.test(url)) {
+        const packed = await realFetch(url.replace('index.wasm', 'engine-gz.wasm'), init);
+        if (!packed.ok) return packed;
+        const body = packed.body.pipeThrough(new DecompressionStream('gzip'));
+        return new Response(body, { headers: { 'Content-Type': 'application/wasm' } });
+      }
+      if (/index\.pck(\?|$)/.test(url)) {
+        // The locked public version has opened the game data already.
+        if (window.unlockedPck) {
+          return new Response(window.unlockedPck, { headers: { 'Content-Type': 'application/octet-stream' } });
+        }
+        const data = await realFetch(url.replace('index.pck', 'game-pck.wasm'), init);
+        if (!data.ok) return data;
+        return new Response(data.body, { headers: { 'Content-Type': 'application/octet-stream' } });
+      }
+      return realFetch(input, init);
+    };
+  })();
+</script>
+<script src="index.js"></script>
+<script>
+  const GODOT_CONFIG = {"args":[],"canvasResizePolicy":2,"emscriptenPoolSize":8,"ensureCrossOriginIsolationHeaders":false,"executable":"index","experimentalVK":false,"fileSizes":{"index.pck":1463172,"index.wasm":39513091},"focusCanvas":true,"gdextensionLibs":[],"godotPoolSize":4};
+  const status = document.getElementById('status');
+  const bar = document.getElementById('bar');
+  const note = document.getElementById('note');
+
+  function fail(message) {
+    note.textContent = message;
+    bar.parentElement.hidden = true;
+  }
+
+  // Starts the engine. The locked public version (web/lock.html) calls it
+  // once the password has opened the game data.
+  window.startGame = function () {
+    if (window.gameStarted) return;
+    window.gameStarted = true;
+    run();
+  };
+
+  function run() {
+  if (!window.DecompressionStream) {
+    fail('This browser is too old to run the game. Try a current Chrome, Safari, Firefox or Edge.');
+  } else {
+    const engine = new Engine(GODOT_CONFIG);
+    const missing = Engine.getMissingFeatures({ threads: false });
+    if (missing.length) {
+      fail('This browser is missing what the game needs: ' + missing.join(', ') + '.');
+    } else {
+      engine.startGame({
+        onProgress: function (current, total) {
+          if (total > 0) bar.style.width = Math.min(100, (current / total) * 100) + '%';
+        },
+      }).then(function () {
+        status.hidden = true;
+      }).catch(function (err) {
+        fail('The game could not start: ' + (err && err.message ? err.message : err));
+      });
+    }
+  }
+  }
+
+  if (!window.GAME_LOCKED || window.unlockedPck) window.startGame();
+</script>
